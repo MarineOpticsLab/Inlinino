@@ -1,36 +1,46 @@
+import os
+import sys
+import glob
+import logging
+import uuid
+import zipfile
+from math import floor
+from time import time, gmtime, strftime
 import serial
+from serial.tools.list_ports import comports as list_serial_comports
+import numpy as np
+import pyqtgraph as pg
 from pyqtgraph.Qt import QtGui, QtCore, QtWidgets, uic
 from PyQt5 import QtMultimedia
-import pyqtgraph as pg
-import sys, os, glob
-import logging
-from time import time, gmtime, strftime
-from serial.tools.list_ports import comports as list_serial_comports
-from inlinino import RingBuffer, CFG, __version__, PATH_TO_RESOURCES
-from inlinino.instruments import Instrument, SerialInterface, SocketInterface, InterfaceException
+from pyACS.acs import ACS as ACSParser
+import pySatlantic.instrument as pySat
+
+from inlinino import RingBuffer, __version__, PATH_TO_RESOURCES, COLOR_SET
+from inlinino.app_signal import InstrumentSignals, HyperNavSignals
+from inlinino.cfg import CFG
+from inlinino.instruments import Instrument, SerialInterface, SocketInterface, USBInterface, USBHIDInterface, \
+    InterfaceException
 from inlinino.instruments.acs import ACS
+from inlinino.instruments.apogee import ApogeeQuantumSensor
 from inlinino.instruments.dataq import DATAQ
 from inlinino.instruments.hyperbb import HyperBB
+from inlinino.instruments.hypernav import HyperNav, read_manufacturer_pixel_registration
 from inlinino.instruments.lisst import LISST
 from inlinino.instruments.nmea import NMEA
+from inlinino.instruments.ontrak import Ontrak, USBADUHIDInterface
+from inlinino.instruments.satlantic import Satlantic
 from inlinino.instruments.suna import SunaV1, SunaV2
 from inlinino.instruments.taratsg import TaraTSG
-from pyACS.acs import ACS as ACSParser
 from inlinino.instruments.lisst import LISSTParser
-import numpy as np
-from math import floor
+from inlinino.widgets.aux_data import AuxDataWidget
+from inlinino.widgets.flow_control import FlowControlWidget
+from inlinino.widgets.hypernav import HyperNavCalWidget
+from inlinino.widgets.metadata import MetadataWidget
+from inlinino.widgets.pump_control import PumpControlWidget
+from inlinino.widgets.select_channel import SelectChannelWidget
+
 
 logger = logging.getLogger('GUI')
-
-
-class InstrumentSignals(QtCore.QObject):
-    status_update = QtCore.pyqtSignal()
-    packet_received = QtCore.pyqtSignal()
-    packet_corrupted = QtCore.pyqtSignal()
-    packet_logged = QtCore.pyqtSignal()
-    new_data = QtCore.pyqtSignal(object, float)
-    new_aux_data = QtCore.pyqtSignal(list)
-    alarm = QtCore.pyqtSignal(bool)
 
 
 def seconds_to_strmmss(seconds):
@@ -42,16 +52,7 @@ def seconds_to_strmmss(seconds):
 class MainWindow(QtGui.QMainWindow):
     BACKGROUND_COLOR = '#F8F8F2'
     FOREGROUND_COLOR = '#26292C'
-    PEN_COLORS = ['#1f77b4',  # muted blue
-                  '#2ca02c',  # cooked asparagus green
-                  '#ff7f0e',  # safety orange
-                  '#d62728',  # brick red
-                  '#9467bd',  # muted purple
-                  '#8c564b',  # chestnut brown
-                  '#e377c2',  # raspberry yogurt pink
-                  '#7f7f7f',  # middle gray
-                  '#bcbd22',  # curry yellow-green
-                  '#17becf']  # blue-teal
+    PEN_COLORS = COLOR_SET
     BUFFER_LENGTH = 240
     MAX_PLOT_REFRESH_RATE = 4   # Hz
 
@@ -59,7 +60,8 @@ class MainWindow(QtGui.QMainWindow):
         super(MainWindow, self).__init__()
         uic.loadUi(os.path.join(PATH_TO_RESOURCES, 'main.ui'), self)
         # Graphical Adjustments
-        self.dock_widget.setTitleBarWidget(QtGui.QWidget(None))
+        self.dock_widget_primary.setTitleBarWidget(QtGui.QWidget(None))
+        self.dock_widget_secondary.setTitleBarWidget(QtGui.QWidget(None))
         self.label_app_version.setText('Inlinino v' + __version__)
         # Set Colors
         palette = QtGui.QPalette()
@@ -72,9 +74,11 @@ class MainWindow(QtGui.QMainWindow):
         # pg.setConfigOption('antialias', True)  # Lines are drawn with smooth edges at the cost of reduced performance
         self._buffer_timestamp = None
         self._buffer_data = []
-        self.last_plot_refresh = time()
-        self.timeseries_widget = None
-        self.init_timeseries_plot()
+        self.reset_ts_trace = False
+        self.last_timeseries_plot_refresh = time()
+        self.timeseries_plot_widget = None
+        self.last_spectrum_plot_refresh = time()
+        self.spectrum_plot_widget = None
         # Set instrument
         if instrument:
             self.init_instrument(instrument)
@@ -89,84 +93,141 @@ class MainWindow(QtGui.QMainWindow):
         self.button_setup.clicked.connect(self.act_instrument_setup)
         self.button_serial.clicked.connect(self.act_instrument_interface)
         self.button_log.clicked.connect(self.act_instrument_log)
-        self.button_figure_clear.clicked.connect(self.act_clear_timeseries_plot)
+        self.button_figure_clear.clicked.connect(self.act_clear)
         # Set clock
         self.signal_clock = QtCore.QTimer()
         self.signal_clock.timeout.connect(self.set_clock)
         self.signal_clock.start(1000)
-        # Alarm message box for data timeout
-        self.alarm_sound = QtMultimedia.QMediaPlayer()
-        self.alarm_playlist = QtMultimedia.QMediaPlaylist(self.alarm_sound)
-        for file in sorted(glob.glob(os.path.join(PATH_TO_RESOURCES, 'alarm*.wav'))):
-            self.alarm_playlist.addMedia(QtMultimedia.QMediaContent(QtCore.QUrl.fromLocalFile(file)))
-        if self.alarm_playlist.mediaCount() < 1:
-            logger.warning('No alarm sounds available: disabled alarm')
-        self.alarm_playlist.setPlaybackMode(QtMultimedia.QMediaPlaylist.Loop)  # Playlist is needed for infinite loop
-        self.alarm_sound.setPlaylist(self.alarm_playlist)
-        # self.alarm_sound.setMedia(QtMultimedia.QMediaContent(QtCore.QUrl.fromLocalFile(
-        #     os.path.join(PATH_TO_RESOURCES, 'alarm-arcade.wav'))))
-        self.alarm_message_box_active = False
-        self.alarm_message_box = QtWidgets.QMessageBox()
-        self.alarm_message_box.setIcon(QtWidgets.QMessageBox.Warning)
-        self.alarm_message_box.setWindowTitle("Data Timeout Alarm")
-        self.alarm_message_box.setText("An error with the serial connection occured or "
-                                       "no data was received in the past minute.\n\n"
-                                       "Does the instrument receive power?\n"
-                                       "Are the serial cable and serial to USB adapter connected?\n"
-                                       "Is the instruments set to continuously send data?\n")
-        self.alarm_message_box.setStandardButtons(QtWidgets.QMessageBox.Ignore)
-        self.alarm_message_box.buttonClicked.connect(self.alarm_message_box_button_clicked)
-        # Plugins variables
-        self.plugin_aux_data_variable_names = []
-        self.plugin_aux_data_variable_values = []
+        # Set Alarm: data timeout
+        self.alarm_message_box = MessageBoxAlarm(self)
+        # Widgets variables
+        self.widget_metadata = None
+        self.widgets = []
+
+    def add_widget(self, widget, secondary_dock=True):
+        self.widgets.append(widget(self.instrument))
+        self.widgets[-1].layout.setContentsMargins(QtCore.QMargins(0, 0, 0, 0))
+        if secondary_dock:
+            self.docked_widget_secondary_layout.addWidget(self.widgets[-1])
+        else:
+            self.docked_widget_primary_layout.addWidget(self.widgets[-1])
+
+    def toggle_secondary_dock(self, init=False):
+        if self.instrument.secondary_dock_widget_enabled:
+            if not self.dock_widget_secondary.isVisible() or init:
+                self.resize(self.width() + 207, self.height())  # Bug expands vertically
+                self.dock_widget_secondary.show()
+        else:
+            if self.dock_widget_secondary.isVisible() or init:
+                if not init:
+                    self.resize(self.width() - 207, self.height())
+                self.dock_widget_secondary.hide()
 
     def init_instrument(self, instrument):
         self.instrument = instrument
         self.label_instrument_name.setText(self.instrument.short_name)
+        # Set interface
+        if self.instrument.interface_name.startswith('socket'):
+            self.label_open_port.setText('Socket')
+        elif self.instrument.interface_name.startswith('usb'):
+            self.label_open_port.setText('USB Port')
+        # Connect Signals
         self.instrument.signal.status_update.connect(self.on_status_update)
         self.instrument.signal.packet_received.connect(self.on_packet_received)
         self.instrument.signal.packet_corrupted.connect(self.on_packet_corrupted)
         self.instrument.signal.packet_logged.connect(self.on_packet_logged)
-        self.instrument.signal.new_data.connect(self.on_new_data)
-        self.instrument.signal.alarm.connect(self.on_data_timeout)
-        self.on_status_update()  # Need to be run as on instrument setup the signals were not connected
+        self.instrument.signal.new_ts_data.connect(self.on_new_ts_data)
+        if self.instrument.signal.alarm is not None:
+            self.instrument.signal.alarm.connect(self.on_data_timeout)
+        # Set Widgets
+        available_widgets = ((AuxDataWidget, False),
+                             (FlowControlWidget, True),
+                             (HyperNavCalWidget, True),
+                             (MetadataWidget, True),
+                             (PumpControlWidget, True),
+                             (SelectChannelWidget, False))
+        primary_vertical_spacer, secondary_vertical_spacer = True, True
+        for widget, secondary_dock in available_widgets:
+            if getattr(self.instrument, f'widget_{widget.__snake_name__[:-7]}_enabled') or\
+                    widget.__name__ in self.instrument.widgets_to_load:
+                self.add_widget(widget, secondary_dock)
+                if widget.expanding:
+                    if secondary_dock:
+                        secondary_vertical_spacer = False
+                    else:
+                        primary_vertical_spacer = False
+        # Add vertical spacer to docks
+        if primary_vertical_spacer:
+            self.docked_widget_primary_layout.addItem(
+                QtGui.QSpacerItem(20, 0, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.MinimumExpanding)
+            )
+        if secondary_vertical_spacer:
+            self.docked_widget_secondary_layout.addItem(
+                QtGui.QSpacerItem(20, 0, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.MinimumExpanding)
+            )
+        # Set secondary dock
+        self.toggle_secondary_dock(init=True)
+        # Set Central Widget with Plot(s)
+        if self.instrument.spectrum_plot_enabled:
+            if self.spectrum_plot_widget is None:
+                self.spectrum_plot_widget = self.create_spectrum_plot_widget(**self.instrument.spectrum_plot_axis_labels)
+            self.centralwidget.layout().addWidget(self.spectrum_plot_widget)
+            self.set_spectrum_plot_widget()
+            self.instrument.signal.new_spectrum_data.connect(self.on_new_spectrum_data)
+        self.timeseries_plot_widget = self.create_timeseries_plot_widget()
+        self.centralwidget.layout().addWidget(self.timeseries_plot_widget)
+        # Run status update
+        #   didn't run with instrument.setup because signal was not connected
+        #   need to be after widget(s) initialization
+        self.on_status_update()
 
-        # Set Plugins specific to instrument
-        # Auxiliary Data Plugin
-        self.group_box_aux_data.setVisible(self.instrument.plugin_aux_data)
-        if self.instrument.plugin_aux_data:
-            # Set aux variable names
-            for v in self.instrument.plugin_aux_data_variable_names:
-                self.plugin_aux_data_variable_names.append(QtGui.QLabel(v))
-                self.plugin_aux_data_variable_values.append(QtGui.QLabel('?'))
-                self.group_box_aux_data_layout.addRow(self.plugin_aux_data_variable_names[-1],
-                                                      self.plugin_aux_data_variable_values[-1])
-            # Connect signal
-            self.instrument.signal.new_aux_data.connect(self.on_new_aux_data)
+    @staticmethod
+    def create_timeseries_plot_widget():
+        widget = pg.PlotWidget(axisItems={'bottom': pg.DateAxisItem(utcOffset=0)}, enableMenu=False)
+        widget.plotItem.setLabel('bottom', 'Time ', units='UTC')
+        widget.plotItem.getAxis('bottom').enableAutoSIPrefix(False)
+        widget.plotItem.setLabel('left', 'Signal')
+        widget.plotItem.getAxis('left').enableAutoSIPrefix(False)
+        # widget.plotItem.setLimits(minYRange=0, maxYRange=4500)  # In version 0.9.9
+        widget.plotItem.setMouseEnabled(x=False, y=True)
+        widget.plotItem.showGrid(x=False, y=True)
+        widget.plotItem.enableAutoRange(x=True, y=True)
+        widget.plotItem.addLegend()
+        return widget
 
-        # Select Channels To Plot Plugin
-        self.group_box_active_timeseries_variables.setVisible(self.instrument.plugin_active_timeseries_variables)
-        if self.instrument.plugin_active_timeseries_variables:
-            # Set sel channels check_box
-            for v in self.instrument.plugin_active_timeseries_variables_names:
-                check_box = QtWidgets.QCheckBox(v)
-                check_box.stateChanged.connect(self.on_active_timeseries_variables_update)
-                if v in self.instrument.plugin_active_timeseries_variables_selected:
-                    check_box.setChecked(True)
-                self.group_box_active_timeseries_variables_scroll_area_content_layout.addWidget(check_box)
+    @staticmethod
+    def create_spectrum_plot_widget(x_label_name='Wavelength', x_label_units='nm',
+                                    y_label_name='Signal', y_label_units=''):
+        widget = pg.PlotWidget(enableMenu=True)
+        widget.plotItem.setLabel('bottom', x_label_name, units=x_label_units)
+        widget.plotItem.getAxis('bottom').enableAutoSIPrefix(False)
+        widget.plotItem.setLabel('left', y_label_name, units=y_label_units)
+        widget.plotItem.getAxis('left').enableAutoSIPrefix(False)
+        widget.plotItem.setMouseEnabled(x=True, y=True)
+        widget.plotItem.showGrid(x=True, y=True)
+        widget.plotItem.enableAutoRange(x=True, y=True)
+        widget.plotItem.addLegend()
+        return widget
 
-    def init_timeseries_plot(self):
-        self.timeseries_widget = pg.PlotWidget(axisItems={'bottom': pg.DateAxisItem(utcOffset=0)}, enableMenu=False)
-        self.timeseries_widget.plotItem.setLabel('bottom', 'Time ', units='UTC')
-        self.timeseries_widget.plotItem.getAxis('bottom').enableAutoSIPrefix(False)
-        self.timeseries_widget.plotItem.setLabel('left', 'Signal')
-        self.timeseries_widget.plotItem.getAxis('left').enableAutoSIPrefix(False)
-        # self.timeseries_widget.plotItem.setLimits(minYRange=0, maxYRange=4500)  # In version 0.9.9
-        self.timeseries_widget.plotItem.setMouseEnabled(x=False, y=True)
-        self.timeseries_widget.plotItem.showGrid(x=False, y=True)
-        self.timeseries_widget.plotItem.enableAutoRange(x=True, y=True)
-        self.timeseries_widget.plotItem.addLegend()
-        self.setCentralWidget(self.timeseries_widget)
+    def set_spectrum_plot_widget(self):
+        self.spectrum_plot_widget.clear()  # Remove all items (past frame headers)
+        min_x, max_x = None, None
+        for i, (name, x) in enumerate(zip(self.instrument.spectrum_plot_trace_names,
+                                          self.instrument.spectrum_plot_x_values)):
+                min_x = min(min_x, min(x)) if min_x is not None else min(x)
+                max_x = max(max_x, max(x)) if max_x is not None else max(x)
+                self.spectrum_plot_widget.addItem(pg.PlotCurveItem(
+                    pen=pg.mkPen(color=COLOR_SET[i % len(COLOR_SET)], width=2), name=name))
+        min_x = 0 if min_x is None else min_x
+        max_x = 1 if max_x is None else max_x
+        self.spectrum_plot_widget.setXRange(min_x, max_x)
+        if hasattr(self.instrument, 'spectrum_plot_x_label'):
+            x_label_name, x_label_units = self.instrument.spectrum_plot_x_label
+            self.spectrum_plot_widget.plotItem.setLabel('bottom', x_label_name, units=x_label_units)
+        if hasattr(self.instrument, 'spectrum_plot_y_label'):
+            y_label_name, y_label_units = self.instrument.spectrum_plot_y_label
+            self.spectrum_plot_widget.plotItem.setLabel('left', y_label_name, units=y_label_units)
+        self.spectrum_plot_widget.setLimits(minXRange=min_x, maxXRange=max_x)
 
     def set_clock(self):
         zulu = gmtime(time())
@@ -175,37 +236,81 @@ class MainWindow(QtGui.QMainWindow):
 
     def act_instrument_setup(self):
         logger.debug('Setup instrument')
-        setup_dialog = DialogInstrumentSetup(self.instrument.cfg_id, self)
+        setup_dialog = DialogInstrumentUpdate(self.instrument.uuid, self)
         setup_dialog.show()
         if setup_dialog.exec_():
             self.instrument.setup(setup_dialog.cfg)
             self.label_instrument_name.setText(self.instrument.short_name)
+            # Set Interface Name
+            if self.instrument.interface_name.startswith('com'):
+                self.label_open_port.setText('Serial Port')
+            elif self.instrument.interface_name.startswith('socket'):
+                self.label_open_port.setText('Socket')
+            elif self.instrument.interface_name.startswith('usb'):
+                self.label_open_port.setText('USB Port')
+            # Reset Plots
+            self.reset_ts_trace = True  # Force update of variable names in timeseries
+            if self.instrument.spectrum_plot_enabled:
+                self.set_spectrum_plot_widget()
+            # Reset Widgets
+            for widget in self.widgets:
+                widget.reset()
+            self.toggle_secondary_dock()
 
     def act_instrument_interface(self):
+        def error_dialog():
+            logger.warning(e)
+            QtGui.QMessageBox.warning(self, "Inlinino: Connect " + self.instrument.name,
+                                      'ERROR: Failed connecting ' + self.instrument.name + '. ' +
+                                      str(e),
+                                      QtGui.QMessageBox.Ok)
         if self.instrument.alive:
             logger.debug('Disconnect instrument')
             self.instrument.close()
         else:
-            if type(self.instrument._interface) == SerialInterface:
+            if issubclass(type(self.instrument._interface), SerialInterface):
                 dialog = DialogSerialConnection(self)
-            elif type(self.instrument._interface) == SocketInterface:
-                dialog = DialogSocketConnection(self)
-            dialog.show()
-            if dialog.exec_():
-                try:
-                    if type(self.instrument._interface) == SerialInterface:
+                dialog.show()
+                if dialog.exec_():
+                    try:
                         self.instrument.open(port=dialog.port, baudrate=dialog.baudrate, bytesize=dialog.bytesize,
                                              parity=dialog.parity, stopbits=dialog.stopbits, timeout=dialog.timeout)
-                    elif type(self.instrument._interface) == SocketInterface:
+                        # Save connection parameters for next time
+                        CFG.read()
+                        CFG.interfaces.setdefault(self.instrument.uuid, {})
+                        for k in ('port', 'baudrate', 'bytesize', 'parity', 'stopbits', 'timeout'):
+                            CFG.interfaces[self.instrument.uuid][k] = getattr(dialog, k)
+                        CFG.write()
+                    except InterfaceException as e:
+                        error_dialog()
+            elif issubclass(type(self.instrument._interface), SocketInterface):
+                dialog = DialogSocketConnection(self)
+                dialog.show()
+                if dialog.exec_():
+                    try:
                         self.instrument.open(ip=dialog.ip, port=dialog.port)
+                        # Save connection parameters for next time
+                        CFG.read()
+                        CFG.interfaces.setdefault(self.instrument.uuid, {})
+                        for k in ('ip', 'port'):
+                            CFG.interfaces[self.instrument.uuid]['socket_' + k] = getattr(dialog, k)
+                        CFG.write()
+                    except InterfaceException as e:
+                        error_dialog()
+            elif issubclass(type(self.instrument._interface), USBInterface) or \
+                    issubclass(type(self.instrument._interface), USBHIDInterface) or \
+                    issubclass(type(self.instrument._interface), USBADUHIDInterface):
+                # No need for dialog as automatic
+                try:
+                    self.instrument.open()
                 except InterfaceException as e:
-                    QtGui.QMessageBox.warning(self, "Inlinino: Connect " + self.instrument.name,
-                                              'ERROR: Failed connecting ' + self.instrument.name + '. ' +
-                                              str(e),
-                                              QtGui.QMessageBox.Ok)
+                    error_dialog()
+            else:
+                logger.error('Interface not supported by GUI.')
+                return
 
     def act_instrument_log(self):
-        if self.instrument.log_active():
+        if self.instrument.log_active:
             logger.debug('Stop logging')
             self.instrument.log_stop()
         else:
@@ -218,10 +323,14 @@ class MainWindow(QtGui.QMainWindow):
                 logger.debug('Start logging')
                 self.instrument.log_start()
 
-    def act_clear_timeseries_plot(self):
+    def act_clear(self):
         if len(self._buffer_data) > 0:
             # Send no data which reset buffers
-            self.instrument.signal.new_data.emit([], time())
+            self.instrument.signal.new_ts_data.emit([], time())
+        if self.instrument.spectrum_plot_enabled:
+            self.set_spectrum_plot_widget()
+        for widget in self.widgets:
+            widget.clear()
 
     @QtCore.pyqtSlot()
     def on_status_update(self):
@@ -229,7 +338,7 @@ class MainWindow(QtGui.QMainWindow):
             self.button_serial.setText('Close')
             self.button_serial.setToolTip('Disconnect instrument.')
             self.button_log.setEnabled(True)
-            if self.instrument.log_active():
+            if self.instrument.log_active:
                 status = 'Logging'
                 if self.instrument.log_raw_enabled:
                     if self.instrument.log_prod_enabled:
@@ -258,14 +367,16 @@ class MainWindow(QtGui.QMainWindow):
             self.button_serial.setText('Open')
             self.button_serial.setToolTip('Connect instrument.')
             self.button_log.setEnabled(False)
-        self.le_filename.setText(self.instrument.log_get_filename())
-        self.le_directory.setText(self.instrument.log_get_path())
+        self.le_filename.setText(self.instrument.log_filename)
+        self.le_directory.setText(self.instrument.log_path)
         self.packets_received = 0
         self.label_packets_received.setText(str(self.packets_received))
         self.packets_logged = 0
         self.label_packets_logged.setText(str(self.packets_logged))
         self.packets_corrupted = 0
         self.label_packets_corrupted.setText(str(self.packets_corrupted))
+        for widget in self.widgets:
+            widget.counter_reset()
 
     @QtCore.pyqtSlot()
     def on_packet_received(self):
@@ -295,21 +406,26 @@ class MainWindow(QtGui.QMainWindow):
 
     @QtCore.pyqtSlot(list, float)
     @QtCore.pyqtSlot(np.ndarray, float)
-    def on_new_data(self, data, timestamp):
-        if len(self._buffer_data) != len(data):
+    def on_new_ts_data(self, data, timestamp):
+        if len(self._buffer_data) != len(data) or self.reset_ts_trace:
+            self.reset_ts_trace = False
             # Init buffers
             self._buffer_timestamp = RingBuffer(self.BUFFER_LENGTH)
             self._buffer_data = [RingBuffer(self.BUFFER_LENGTH) for i in range(len(data))]
-            # Init Plot (need to do so when number of curve changes)
-            self.init_timeseries_plot()
+            # Re-initialize Plot (need to do so when number of curve changes)
+            # TODO FIX HERE for multiple plots
+            self.timeseries_plot_widget.clear()
+            # new_plot_widget = self.create_timeseries_plot_widget()
+            # self.centralwidget.layout().replaceWidget(self.timeseries_plot_widget, new_plot_widget)
+            # self.timeseries_plot_widget = new_plot_widget
             # Init curves
-            if hasattr(self.instrument, 'plugin_active_timeseries_variables_selected'):
-                legend = self.instrument.plugin_active_timeseries_variables_selected
+            if hasattr(self.instrument, 'widget_active_timeseries_variables_selected'):
+                legend = self.instrument.widget_active_timeseries_variables_selected
             else:
                 legend = [f"{name} ({units})" for name, units in
                           zip(self.instrument.variable_names, self.instrument.variable_units)]
             for i in range(len(data)):
-                self.timeseries_widget.plotItem.addItem(
+                self.timeseries_plot_widget.plotItem.addItem(
                     pg.PlotCurveItem(pen=pg.mkPen(color=self.PEN_COLORS[i % len(self.PEN_COLORS)], width=2),
                                      name=legend[i])
                 )
@@ -318,9 +434,8 @@ class MainWindow(QtGui.QMainWindow):
         self._buffer_timestamp.extend(timestamp)
         for i in range(len(data)):
             self._buffer_data[i].extend(data[i])
-        # TODO Update real-time figure (depend on instrument type)
         # Update timeseries figure
-        if time() - self.last_plot_refresh < 1 / self.MAX_PLOT_REFRESH_RATE:
+        if time() - self.last_timeseries_plot_refresh < 1 / self.MAX_PLOT_REFRESH_RATE:
             return
         timestamp = self._buffer_timestamp.get(self.BUFFER_LENGTH)  # Not used anymore
         for i in range(len(data)):
@@ -332,55 +447,95 @@ class MainWindow(QtGui.QMainWindow):
                 sel = np.logical_not(nsel)
                 y[nsel] = np.interp(x[nsel], x[sel], y[sel])
                 # self.timeseries_widget.plotItem.items[i].setData(y, connect="finite")
-                self.timeseries_widget.plotItem.items[i].setData(timestamp[sel], y[sel], connect="finite")
-        self.timeseries_widget.plotItem.enableAutoRange(x=True)  # Needed as somehow the user disable sometimes
-        self.last_plot_refresh = time()
+                self.timeseries_plot_widget.plotItem.items[i].setData(timestamp[sel], y[sel], connect="finite")
+        self.timeseries_plot_widget.plotItem.enableAutoRange(x=True)  # Needed as somehow the user disable sometimes
+        self.last_timeseries_plot_refresh = time()
 
     @QtCore.pyqtSlot(list)
-    def on_new_aux_data(self, data):
-        if self.instrument.plugin_aux_data:
-            for i, v in enumerate(data):
-                self.plugin_aux_data_variable_values[i].setText(str(v))
-
-    @QtCore.pyqtSlot(int)
-    def on_active_timeseries_variables_update(self, state):
-        if self.instrument.plugin_active_timeseries_variables:
-            self.instrument.udpate_active_timeseries_variables(self.sender().text(), state)
+    def on_new_spectrum_data(self, data):
+        if time() - self.last_spectrum_plot_refresh < 1 / self.MAX_PLOT_REFRESH_RATE:
+            return
+        for i, y in enumerate(data):
+            if y is None or i > len(self.instrument.spectrum_plot_x_values):
+                continue
+            x = self.instrument.spectrum_plot_x_values[i]
+            # Replace NaN and Inf by interpolated values
+            nsel = np.logical_or(np.isinf(y), np.isnan(y))
+            sel = np.logical_not(nsel)
+            y[nsel] = np.interp(x[nsel], x[sel], y[sel])
+            # TODO Check with real instrument if really need trick above
+            self.spectrum_plot_widget.plotItem.items[i].setData(x, y, connect="finite")
+        self.last_spectrum_plot_refresh = time()
 
     @QtCore.pyqtSlot(bool)
     def on_data_timeout(self, active):
-        if active and not self.alarm_message_box_active:
-            # Start alarm and Open message box
-            self.alarm_playlist.setCurrentIndex(0)
-            self.alarm_sound.play()
-            self.alarm_message_box.open()
-            getattr(self.alarm_message_box, 'raise')
-            self.alarm_message_box_active = True
-        elif not active and self.alarm_message_box_active:
-            # Stop alarm and Close message box
-            self.alarm_sound.stop()
-            self.alarm_message_box.close()
-            self.alarm_message_box_active = False
-
-    def alarm_message_box_button_clicked(self, button):
-        if button.text() == 'Ignore':
-            logger.info('Ignored alarm')
-            self.alarm_sound.stop()
-            self.alarm_message_box.close()
-            self.alarm_message_box_active = False
+        if active and not self.alarm_message_box.active:
+            self.alarm_message_box.show(self.instrument.name, self.instrument.interface_name)
+        elif not active and self.alarm_message_box.active:
+            self.alarm_message_box.hide()
 
     def closeEvent(self, event):
-        msg = QtGui.QMessageBox(self)
-        msg.setIcon(QtGui.QMessageBox.Question)
-        msg.setWindowTitle("Inlinino: Closing Application")
-        msg.setText("Are you sure to quit ?")
-        msg.setStandardButtons(QtGui.QMessageBox.Yes | QtGui.QMessageBox.No)
-        msg.setDefaultButton(QtGui.QMessageBox.No)
+        icon, txt = QtGui.QMessageBox.Question, "Are you sure you want to exit?"
+        if self.instrument.widget_hypernav_cal_enabled:
+            sbs_txt = self.instrument.check_sbs_sn()
+            if sbs_txt:
+                icon, txt = QtGui.QMessageBox.Warning, txt + "\nDo you want to exit anyway?"
+        msg = QtGui.QMessageBox(icon, "Inlinino: Closing Application", txt,
+                                QtGui.QMessageBox.Yes | QtGui.QMessageBox.No, self)
+        msg.setWindowModality(QtCore.Qt.WindowModal)
         if msg.exec_() == QtGui.QMessageBox.Yes:
             QtGui.QApplication.instance().closeAllWindows()  # NEEDED IF OTHER WINDOWS OPEN BY SPECIFIC INSTRUMENTS
             event.accept()
         else:
             event.ignore()
+
+
+class MessageBoxAlarm(QtWidgets.QMessageBox):
+    TEXT = "An error occurred with the serial connection or " \
+           "no data was received in the past minute.\n" \
+           "  + Is the instrument powered?\n" \
+           "  + Is the communication cable (e.g. serial, usb, ethernet) connected?\n" \
+           "  + Is the instruments configured properly (e.g. automatically send data)?\n"
+
+    def __init__(self, parent):
+        super().__init__(QtWidgets.QMessageBox.Warning, "Inlinino: Data Timeout Alarm",
+                         self.TEXT, QtWidgets.QMessageBox.Ignore, parent)
+        self.setWindowModality(QtCore.Qt.WindowModal)
+        self.active = False
+        self.buttonClicked.connect(self.ignore)
+
+        # Setup Sound
+        self.alarm_sound = QtMultimedia.QMediaPlayer()
+        self.alarm_playlist = QtMultimedia.QMediaPlaylist(self.alarm_sound)
+        for file in sorted(glob.glob(os.path.join(PATH_TO_RESOURCES, 'alarm*.wav'))):
+            self.alarm_playlist.addMedia(QtMultimedia.QMediaContent(QtCore.QUrl.fromLocalFile(file)))
+        if self.alarm_playlist.mediaCount() < 1:
+            logger.warning('No alarm sounds available: disabled alarm')
+        self.alarm_playlist.setPlaybackMode(QtMultimedia.QMediaPlaylist.Loop)  # Playlist is needed for infinite loop
+        self.alarm_sound.setPlaylist(self.alarm_playlist)
+
+    def show(self, instrument_name=None, interface_name=None):
+        if not self.active:
+            txt = ""
+            if instrument_name is not None:
+                txt += f"Instument: {instrument_name}\n"
+            if interface_name is not None:
+                txt += f"Port: {interface_name}\n\n"
+            self.setText(txt + self.TEXT)
+            super().show()
+            self.alarm_playlist.setCurrentIndex(0)
+            self.alarm_sound.play()
+            self.active = True
+
+    def hide(self):
+        if self.active:
+            self.alarm_sound.stop()
+            super().hide()
+            self.active = False
+
+    def ignore(self):
+        logger.info('Ignored alarm')
+        self.hide()
 
 
 class DialogStartUp(QtGui.QDialog):
@@ -390,7 +545,9 @@ class DialogStartUp(QtGui.QDialog):
     def __init__(self):
         super(DialogStartUp, self).__init__()
         uic.loadUi(os.path.join(PATH_TO_RESOURCES, 'startup.ui'), self)
-        instruments_configured = [i["manufacturer"] + ' ' + i["model"] + ' ' + i["serial_number"] for i in CFG.instruments]
+        instruments_configured = [i["manufacturer"] + ' ' + i["model"] + ' ' + i["serial_number"]
+                                  for i in CFG.instruments.values()]
+        self.instrument_uuids = [k for k in CFG.instruments.keys()]
         # self.instruments_to_setup = [i[6:-3] for i in sorted(os.listdir(PATH_TO_RESOURCES)) if i[-3:] == '.ui' and i[:6] == 'setup_']
         self.instruments_to_setup = [os.path.basename(i)[6:-3] for i in sorted(glob.glob(os.path.join(PATH_TO_RESOURCES, 'setup_*.ui')))]
         self.combo_box_instrument_to_load.addItems(instruments_configured)
@@ -399,88 +556,60 @@ class DialogStartUp(QtGui.QDialog):
         self.button_load.clicked.connect(self.act_load_instrument)
         self.button_setup.clicked.connect(self.act_setup_instrument)
         self.button_delete.clicked.connect(self.act_delete_instrument)
-        self.selection_index = None
+        self.selected_uuid, self.selected_template = None, None
 
     def act_load_instrument(self):
-        self.selection_index = self.combo_box_instrument_to_load.currentIndex()
+        self.selected_uuid = self.instrument_uuids[self.combo_box_instrument_to_load.currentIndex()]
         self.done(self.LOAD_INSTRUMENT)
 
     def act_setup_instrument(self):
-        self.selection_index = self.combo_box_instrument_to_setup.currentIndex()
+        self.selected_template = self.instruments_to_setup[self.combo_box_instrument_to_setup.currentIndex()]
         self.done(self.SETUP_INSTRUMENT)
 
     def act_delete_instrument(self):
         index = self.combo_box_instrument_to_delete.currentIndex()
+        uuid = self.instrument_uuids[index]
         instrument = self.combo_box_instrument_to_delete.currentText()
-        msg = QtGui.QMessageBox(self)
-        msg.setIcon(QtGui.QMessageBox.Warning)
-        msg.setWindowTitle(f"Inlinino: Delete {instrument}")
-        msg.setText(f"Are you sure to delete instrument: {instrument} ?")
-        msg.setStandardButtons(QtGui.QMessageBox.Yes | QtGui.QMessageBox.No)
-        msg.setDefaultButton(QtGui.QMessageBox.No)
+        msg = QtGui.QMessageBox(QtWidgets.QMessageBox.Warning, f"Inlinino: Delete {instrument}",
+                                f"Are you sure to delete instrument: {instrument} ?",
+                                QtGui.QMessageBox.Yes | QtGui.QMessageBox.No, self)
+        msg.setWindowModality(QtCore.Qt.WindowModal)
         if msg.exec_() == QtGui.QMessageBox.Yes:
-            del CFG.instruments[index]
+            CFG.read()
+            if uuid not in CFG.instruments.keys():
+                txt = f"Failed to delete instrument [{uuid}] {instrument}, " \
+                      f"configuration was updated by another instance of Inlinino."
+                logger.warning(txt)
+                QtGui.QMessageBox.warning(self, "Inlinino: Configuration Error", txt, QtGui.QMessageBox.Ok)
+                return
+            del CFG.instruments[uuid]
             CFG.write()
             self.combo_box_instrument_to_load.removeItem(index)
             self.combo_box_instrument_to_delete.removeItem(index)
-            logger.warning(f"Deleted instrument [{index}] {instrument}")
+            del self.instrument_uuids[index]
+            logger.warning(f"Deleted instrument [{uuid}] {instrument}")
 
 
 class DialogInstrumentSetup(QtGui.QDialog):
     ENCODING = 'ascii'
     OPTIONAL_FIELDS = ['Variable Precision', 'Prefix Custom']
+    ADU100_AN01_GAIN2RANGE = {0: '2.5V', 1: '1.25V', 2: '0.625V', 3: '0.312V', 4: '0.156V', 5: '78.12mV', 6: '39.06mV',
+                              7: '19.53mV'}  # Values are truncated
+    ADU100_AN2_GAIN2RANGE = {1: '10V', 2: '5V'}
 
-    def __init__(self, template, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        if isinstance(template, str):
-            # Load template from instrument type
-            self.create = True
-            self.cfg_index = -1
-            self.cfg = {'module': template}
-            uic.loadUi(os.path.join(PATH_TO_RESOURCES, 'setup_' + template + '.ui'), self)
-        elif isinstance(template, int):
-            # Load from preconfigured instrument
-            self.create = False
-            self.cfg_index = template
-            self.cfg = CFG.instruments[template]
-            uic.loadUi(os.path.join(PATH_TO_RESOURCES, 'setup_' + self.cfg['module'] + '.ui'), self)
-            # Populate fields
-            for k, v in self.cfg.items():
-                if hasattr(self, 'le_' + k):
-                    if isinstance(v, bytes):
-                        getattr(self, 'le_' + k).setText(v.decode().encode('unicode_escape').decode())
-                    elif isinstance(v, list):
-                        getattr(self, 'le_' + k).setText(', '.join([str(vv) for vv in v]))
-                    else:
-                        getattr(self, 'le_' + k).setText(v)
-                elif hasattr(self, 'te_' + k):
-                    if isinstance(v, list):
-                        getattr(self, 'te_' + k).setPlainText(',\n'.join([str(vv) for vv in v]))
-                    else:
-                        getattr(self, 'te_' + k).setPlainText(v)
-                elif hasattr(self, 'combobox_' + k):
-                    if v:
-                        getattr(self, 'combobox_' + k).setCurrentIndex(0)
-                    else:
-                        getattr(self, 'combobox_' + k).setCurrentIndex(1)
-            # Populate special fields specific to each module
-            if self.cfg['module'] == 'dataq':
-                for c in self.cfg['channels_enabled']:
-                    getattr(self, 'checkbox_channel%d_enabled' % (c + 1)).setChecked(True)
-            if hasattr(self, 'combobox_interface'):
-                if 'interface' in self.cfg.keys():
-                    if self.cfg['interface'] == 'serial':
-                        self.combobox_interface.setCurrentIndex(0)
-                    elif self.cfg['interface'] == 'socket':
-                        self.combobox_interface.setCurrentIndex(1)
-        else:
-            raise ValueError('Invalid instance type for template.')
+
+    def connect_backend(self):
+        # Connect buttons
         if 'button_browse_log_directory' in self.__dict__.keys():
             self.button_browse_log_directory.clicked.connect(self.act_browse_log_directory)
         if 'button_browse_device_file' in self.__dict__.keys():
             self.button_browse_device_file.clicked.connect(self.act_browse_device_file)
         if 'button_browse_calibration_file' in self.__dict__.keys():
             self.button_browse_calibration_file.clicked.connect(self.act_browse_calibration_file)
+        if 'button_browse_tdf_files' in self.__dict__.keys():
+            self.button_browse_tdf_files.clicked.connect(self.act_browse_tdf_files)
         if 'button_browse_ini_file' in self.__dict__.keys():
             self.button_browse_ini_file.clicked.connect(self.act_browse_ini_file)
         if 'button_browse_dcal_file' in self.__dict__.keys():
@@ -491,6 +620,18 @@ class DialogInstrumentSetup(QtGui.QDialog):
             self.button_browse_plaque_file.clicked.connect(self.act_browse_plaque_file)
         if 'button_browse_temperature_file' in self.__dict__.keys():
             self.button_browse_temperature_file.clicked.connect(self.act_browse_temperature_file)
+        if 'button_browse_px_reg_prt' in self.__dict__.keys():
+            self.button_browse_px_reg_prt.clicked.connect(self.act_browse_px_reg_prt)
+        if 'button_browse_px_reg_sbd' in self.__dict__.keys():
+            self.button_browse_px_reg_sbd.clicked.connect(self.act_browse_px_reg_sbd)
+        if 'spinbox_analog_channel0_gain' in self.__dict__.keys():
+            self.spinbox_analog_channel0_gain.valueChanged.connect(self.act_update_analog_channel0_input_range)
+        if 'spinbox_analog_channel1_gain' in self.__dict__.keys():
+            self.spinbox_analog_channel1_gain.valueChanged.connect(self.act_update_analog_channel1_input_range)
+        if 'spinbox_analog_channel2_gain' in self.__dict__.keys():
+            self.spinbox_analog_channel2_gain.valueChanged.connect(self.act_update_analog_channel2_input_range)
+        if 'combobox_model' in self.__dict__.keys():
+            self.combobox_model.currentIndexChanged.connect(self.act_activate_fields_for_adu_model)
 
         # Cannot use default save button as does not provide mean to correctly validate user input
         self.button_save = QtGui.QPushButton('Save')
@@ -507,10 +648,42 @@ class DialogInstrumentSetup(QtGui.QDialog):
             caption='Choose device file', filter='Device File (*.dev *.txt)')
         self.le_device_file.setText(file_name)
 
-    def act_browse_calibration_file(self):
+    def act_browse_calibration_file(self):  # Specific to Suna
         file_name, selected_filter = QtGui.QFileDialog.getOpenFileName(
-            caption='Choose calibration file', filter='Calibration File (*.cal *.CAL)')  # *.tdf *.TDF
+            caption='Choose calibration file', filter='Calibration File (*.cal *.CAL)')
         self.le_calibration_file.setText(file_name)
+
+    def act_browse_tdf_files(self):  # sip, cal, or tdf
+        file_names, selected_filter = QtGui.QFileDialog.getOpenFileNames(
+            caption='Choose calibration file', filter='Calibration File (*.cal *.CAL *.tdf *.TDF *.sip)')
+        # Check if sip file
+        is_sip = False
+        for f in file_names:
+            if os.path.splitext(f)[1].lower() == '.sip':
+                is_sip = True
+                break
+        if len(file_names) > 1 and is_sip:
+            self.notification('Accept one .sip file OR multiple .cal and .tdf files.')
+            return
+        # Empty current files for immersed selection
+        for i in reversed(range(self.scroll_area_layout_immersed.count())):
+            item = self.scroll_area_layout_immersed.itemAt(i)
+            if type(item) == QtGui.QWidgetItem:
+                item.widget().setParent(None)
+            elif type(item) == QtGui.QLayoutItem:
+                item.layout().setParent(None)
+        # Update selection of immersed files
+        if is_sip:
+            self.tdf_files = file_names[0]
+            file_names = [f for f in zipfile.ZipFile(self.tdf_files, 'r').namelist()
+                          if os.path.splitext(f)[1].lower() in pySat.Parser.VALID_CAL_EXTENSIONS
+                          and os.path.basename(f)[0] != '.']
+        else:
+            self.tdf_files = file_names
+        for f in file_names:
+            self.scroll_area_layout_immersed.addWidget(QtWidgets.QCheckBox(os.path.basename(f)))
+        self.scroll_area_layout_immersed.addItem(
+            QtGui.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding))
 
     def act_browse_ini_file(self):
         file_name, selected_filter = QtGui.QFileDialog.getOpenFileName(
@@ -537,20 +710,56 @@ class DialogInstrumentSetup(QtGui.QDialog):
             caption='Choose temperature calibration file', filter='Temperature File (*.mat)')
         self.le_temperature_file.setText(file_name)
 
+    def act_browse_px_reg_prt(self):
+        file_name, selected_filter = QtGui.QFileDialog.getOpenFileName(
+            caption='Choose port side pixel registration file',
+            filter='Registration File (*.cgs *.cal *.tdf *.CGS *.CAL *.TDF)')
+        self.le_optional_px_reg_path_prt.setText(file_name)
+
+    def act_browse_px_reg_sbd(self):
+        file_name, selected_filter = QtGui.QFileDialog.getOpenFileName(
+            caption='Choose starboard pixel registration file',
+            filter='Registration File (*.cgs *.cal *.tdf *.CGS *.CAL *.TDF)')
+        self.le_optional_px_reg_path_sbd.setText(file_name)
+
+    def act_update_analog_channel0_input_range(self):
+        self.label_analog_channel0_input_range.setText(
+            f'0 - {self.ADU100_AN01_GAIN2RANGE[self.spinbox_analog_channel0_gain.value()]}')
+
+    def act_update_analog_channel1_input_range(self):
+        self.label_analog_channel1_input_range.setText(
+            f'0 - {self.ADU100_AN01_GAIN2RANGE[self.spinbox_analog_channel1_gain.value()]}')
+
+    def act_update_analog_channel2_input_range(self):
+        self.label_analog_channel2_input_range.setText(
+            f'0 - {self.ADU100_AN2_GAIN2RANGE[self.spinbox_analog_channel2_gain.value()]}')
+
+    def act_activate_fields_for_adu_model(self):
+        model = self.combobox_model.currentText()
+        if model == 'ADU100':
+            self.group_box_analog.setEnabled(True)
+        elif model in ('ADU200', 'ADU208'):
+            self.group_box_analog.setEnabled(False)
+        else:
+            raise ValueError(f'Model {model} not supported.')
+
     def act_save(self):
         # Read form
         fields = [a for a in self.__dict__.keys() if 'combobox_' in a or 'le_' in a]
         empty_fields = list()
         for f in fields:
             field_prefix, field_name = f.split('_', 1)
+            field_optional = 'optional' in f
+            if field_optional:
+                field_name = field_name[9:]
             field_pretty_name = field_name.replace('_', ' ').title()
-            if f == 'combobox_interface':
-                self.cfg[field_name] = self.combobox_interface.currentText()
+            if f in ['combobox_interface', 'combobox_model', *[f'combobox_relay{i}_mode' for i in range(4)]]:
+                self.cfg[field_name] = self.__dict__[f].currentText()
             elif field_prefix == 'le':
-                value = getattr(self, f).text()
-                if not value:
+                value = getattr(self, f).text().strip()
+                if not field_optional and not value:
                     empty_fields.append(field_pretty_name)
-                    # continue  Need to be removed for DataQ with optional products
+                    continue
                 # Apply special formatting to specific variables
                 try:
                     if 'variable_' in field_name:
@@ -568,7 +777,10 @@ class DialogInstrumentSetup(QtGui.QDialog):
                     return
                 self.cfg[field_name] = value
             elif field_prefix == 'te':
-                value = getattr(self, f).toPlainText()
+                value = getattr(self, f).toPlainText().strip()
+                if not value:
+                    empty_fields.append(field_pretty_name)
+                    continue
                 try:
                     value = [v.strip() for v in value.split(',')]
                 except:
@@ -580,16 +792,22 @@ class DialogInstrumentSetup(QtGui.QDialog):
                     self.cfg[field_name] = True
                 else:
                     self.cfg[field_name] = False
+        if self.cfg['module'] == 'dataq':
+            # Remove optional fields specific to dataq
+            f2rm = [f for f in empty_fields if f.startswith('Variable')]
+            for f in f2rm:
+                del empty_fields[empty_fields.index(f)]
         for f in self.OPTIONAL_FIELDS:
             try:
                 empty_fields.pop(empty_fields.index(f))
             except ValueError:
                 pass
-        if self.cfg['module'] == 'dataq':
-            # Remove fields from products
-            f2rm = [f for f in empty_fields if f.startswith('Variable')]
-            for f in f2rm:
-                del empty_fields[empty_fields.index(f)]
+        if hasattr(self, 'tdf_files'):
+            if len(self.tdf_files) == 0:
+                empty_fields.append('Calibration or Telemetry Definition File(s)')
+        if hasattr(self, 'scroll_area_layout_immersed'):
+            if self.scroll_area_layout_immersed.count() == 0:
+                empty_fields.append('Empty .sip file.')
         if empty_fields:
             self.notification('Fill required fields.', '\n'.join(empty_fields))
             return
@@ -631,6 +849,27 @@ class DialogInstrumentSetup(QtGui.QDialog):
                 self.cfg['log_raw'] = True
             if 'log_products' not in self.cfg.keys():
                 self.cfg['log_products'] = True
+        elif self.cfg['module'] == 'ontrak':
+            self.cfg['model'] = self.combobox_model.currentText()
+            self.cfg['relay0_enabled'] = self.checkbox_relay0_enabled.isChecked()
+            self.cfg['event_counter_channels_enabled'], self.cfg['event_counter_k_factors'] = [], []
+            for c in range(4):
+                if getattr(self, 'checkbox_event_counter_channel%d_enabled' % (c)).isChecked():
+                    self.cfg['event_counter_channels_enabled'].append(c)
+                    k = getattr(self, 'spinbox_event_counter_channel%d_k_factor' % (c)).value()
+                    self.cfg['event_counter_k_factors'].append(k)
+            self.cfg['analog_channels_enabled'], self.cfg['analog_channels_gains'] = [], []
+            for c in range(3):
+                if getattr(self, 'checkbox_analog_channel%d_enabled' % (c)).isChecked():
+                    self.cfg['analog_channels_enabled'].append(c)
+                    g = getattr(self, 'spinbox_analog_channel%d_gain' % (c)).value()
+                    self.cfg['analog_channels_gains'].append(g)
+            if not (self.cfg['relay0_enabled'] or self.cfg['event_counter_channels_enabled'] or
+                    (self.cfg['model'] == 'ADU100' and self.cfg['analog_channels_enabled'])):
+                self.notification('At least one switch, one flowmeter, or one analog channel must be selected.')
+                return
+            if not (self.cfg['log_raw'] or self.cfg['log_products']):
+                self.notification('Warning: no data will be logged.')
         elif self.cfg['module'] == 'dataq':
             self.cfg['channels_enabled'] = []
             for c in range(8):
@@ -645,12 +884,43 @@ class DialogInstrumentSetup(QtGui.QDialog):
                 self.cfg['log_raw'] = False
             if 'log_products' not in self.cfg.keys():
                 self.cfg['log_products'] = True
+        elif self.cfg['module'] in 'satlantic':
+            self.cfg['tdf_files'] = self.tdf_files
+            self.cfg['immersed'] = []
+            for i in range(self.scroll_area_layout_immersed.count()):
+                item = self.scroll_area_layout_immersed.itemAt(i)
+                if type(item) == QtGui.QWidgetItem:
+                    self.cfg['immersed'].append(bool(item.widget().checkState()))
+        elif self.cfg['module'] == 'hypernav':
+            try:
+                self.cfg['prt_sbs_sn'] = int(self.cfg['prt_sbs_sn'])
+            except ValueError:
+                self.notification('Port side serial number must be an integer.')
+                return
+            try:
+                self.cfg['sbd_sbs_sn'] = int(self.cfg['sbd_sbs_sn'])
+            except ValueError:
+                self.notification('Starboard serial number must be an integer.')
+                return
+            try:
+                for path in (self.cfg['px_reg_path_prt'], self.cfg['px_reg_path_sbd']):
+                    if not path:
+                        continue
+                    elif os.path.splitext(path)[1] == '.cgs':
+                        read_manufacturer_pixel_registration(path)
+                    elif os.path.splitext(path)[1] in pySat.Instrument.VALID_CAL_EXTENSIONS:
+                        td = pySat.Parser(path)
+                        if not td.variable_frame_length:
+                            raise ValueError('Inlinino only supports SATY*Z files for hypernav.')
+                    else:
+                        raise ValueError(f'Invalid file extension, only support '
+                                         f'{", ".join(pySat.Instrument.VALID_CAL_EXTENSIONS)}and .cgs.')
+            except Exception as e:
+                self.notification('Error in HyperNav configuration.', e)
+                return
         # Update global instrument cfg
-        if self.create:
-            CFG.instruments.append(self.cfg)
-            self.cfg_index = -1
-        else:
-            CFG.instruments[self.cfg_index] = self.cfg.copy()
+        CFG.read()  # Update local cfg if other instance updated cfg
+        CFG.instruments[self.cfg_uuid] = self.cfg.copy()
         CFG.write()
         self.accept()
 
@@ -675,23 +945,131 @@ class DialogInstrumentSetup(QtGui.QDialog):
             if 'variable_precision' in self.cfg:
                 if not (len(self.cfg['variable_precision']) == 1 and self.cfg['variable_precision'][0] == ''):
                     for v in self.cfg['variable_precision']:
-                        if v[0] != '%' and v[-1] not in ['d', 'f']:
-                            self.notification('Invalid variable precision. '
+                        try:
+                            ', '.join(p % d for p, d in zip(self.cfg['variable_precision'],
+                                                            range(len(self.cfg['variable_precision']))))
+                        except ValueError:
+                            self.notification('Invalid variable precision format. '
                                               'Expect type specific formatting (e.g. %d or %.3f) separated by commas.')
                             return False
         return True
 
-    @staticmethod
-    def notification(message, details=None):
-        msg = QtGui.QMessageBox()
-        msg.setIcon(QtGui.QMessageBox.Warning)
-        msg.setText(message)
-        # msg.setInformativeText("This is additional information")
+    def notification(self, message, details=None):
+        msg = QtGui.QMessageBox(QtWidgets.QMessageBox.Warning, "Inlinino: Setup Instrument Warning",
+                                message,
+                                QtGui.QMessageBox.Ok, self)
         if details:
             msg.setDetailedText(str(details))
-        msg.setWindowTitle("Inlinino: Setup Instrument Warning")
-        msg.setStandardButtons(QtGui.QMessageBox.Ok)
+        msg.setWindowModality(QtCore.Qt.WindowModal)
         msg.exec_()
+
+
+class DialogInstrumentCreate(DialogInstrumentSetup):
+    def __init__(self, template, parent=None):
+        # Init parent
+        super().__init__(parent)
+        # Load template from instrument type
+        self.cfg_uuid = str(uuid.uuid1())
+        self.cfg = {'module': template}
+        uic.loadUi(os.path.join(PATH_TO_RESOURCES, 'setup_' + template + '.ui'), self)
+        # Add specific fields
+        if hasattr(self, 'scroll_area_layout_immersed'):
+            self.tdf_files = []
+        # Connect Buttons
+        self.connect_backend()
+
+
+class DialogInstrumentUpdate(DialogInstrumentSetup):
+    def __init__(self, uuid, parent=None):
+        # Init parent
+        super().__init__(parent)
+        # Check if instrument exists
+        if uuid not in CFG.instruments.keys():
+            logger.warning('Instrument was deleted.')
+            QtGui.QMessageBox.warning(self, "Inlinino: Configuration Error",
+                                      'ERROR: Instrument was deleted.',
+                                      QtGui.QMessageBox.Ok)
+            self.cancel()
+        # Load from preconfigured instrument
+        self.cfg_uuid = uuid
+        self.cfg = CFG.instruments[uuid]
+        uic.loadUi(os.path.join(PATH_TO_RESOURCES, 'setup_' + self.cfg['module'] + '.ui'), self)
+        # Get optional fields
+        optional_fields = [k[12:] for k in self.__dict__.keys() if 'optional' in k]
+        # Populate fields
+        for k, v in self.cfg.items():
+            if k in optional_fields:
+                k = 'optional_' + k
+            if hasattr(self, 'le_' + k):
+                if isinstance(v, bytes):
+                    getattr(self, 'le_' + k).setText(v.decode().encode('unicode_escape').decode())
+                elif isinstance(v, list):
+                    getattr(self, 'le_' + k).setText(', '.join([str(vv) for vv in v]))
+                elif isinstance(v, int):
+                    getattr(self, 'le_' + k).setText(f'{v:d}')
+                else:
+                    getattr(self, 'le_' + k).setText(v)
+            elif hasattr(self, 'te_' + k):
+                if isinstance(v, list):
+                    getattr(self, 'te_' + k).setPlainText(',\n'.join([str(vv) for vv in v]))
+                else:
+                    getattr(self, 'te_' + k).setPlainText(v)
+            elif hasattr(self, 'combobox_' + k):
+                if v:
+                    getattr(self, 'combobox_' + k).setCurrentIndex(0)
+                else:
+                    getattr(self, 'combobox_' + k).setCurrentIndex(1)
+        # Populate special fields specific to each module
+        if self.cfg['module'] == 'dataq':
+            for c in self.cfg['channels_enabled']:
+                getattr(self, 'checkbox_channel%d_enabled' % (c + 1)).setChecked(True)
+            # Handle legacy configuration
+            for k in [k for k in self.cfg.keys() if k.startswith('variable_')]:
+                if len(self.cfg[k]) == 1 and self.cfg[k][0] == '':
+                    del self.cfg[k]
+        if self.cfg['module'] == 'ontrak':
+            try:
+                self.combobox_model.setCurrentIndex([self.combobox_model.itemText(i)
+                                                     for i in range(self.combobox_model.count())]
+                                                    .index(self.cfg['model']))
+            except ValueError:
+                logger.warning('Configured model not available in GUI. Interface set to GUI default.')
+            self.act_activate_fields_for_adu_model()
+            try:
+                self.combobox_relay0_mode.setCurrentIndex([self.combobox_relay0_mode.itemText(i)
+                                                           for i in range(self.combobox_relay0_mode.count())]
+                                                          .index(self.cfg['relay0_mode']))
+            except ValueError:
+                logger.warning('Configured relay0_mode not available in GUI. Interface set to GUI default.')
+            self.checkbox_relay0_enabled.setChecked(self.cfg['relay0_enabled'])
+            for c, g in zip(self.cfg['event_counter_channels_enabled'], self.cfg['event_counter_k_factors']):
+                getattr(self, 'checkbox_event_counter_channel%d_enabled' % (c)).setChecked(True)
+                getattr(self, 'spinbox_event_counter_channel%d_k_factor' % (c)).setValue(g)
+            for c, g in zip(self.cfg['analog_channels_enabled'], self.cfg['analog_channels_gains']):
+                getattr(self, 'checkbox_analog_channel%d_enabled' % (c)).setChecked(True)
+                getattr(self, 'spinbox_analog_channel%d_gain' % (c)).setValue(g)
+        if hasattr(self, 'combobox_interface'):
+            if 'interface' in self.cfg.keys():
+                try:
+                    self.combobox_interface.setCurrentIndex([self.combobox_interface.itemText(i)
+                                                             for i in range(self.combobox_interface.count())]
+                                                            .index(self.cfg['interface']))
+                except ValueError:
+                    logger.warning('Configured interface not available in GUI. Interface set to GUI default.')
+        if hasattr(self, 'scroll_area_layout_immersed'):
+            if 'immersed' in self.cfg.keys() and 'tdf_files' in self.cfg.keys():
+                self.tdf_files = self.cfg['tdf_files']
+                for f, i in zip(self.tdf_files, self.cfg['immersed']):
+                    widget = QtWidgets.QCheckBox(os.path.basename(f))
+                    if i:
+                        widget.setChecked(True)
+                    self.scroll_area_layout_immersed.addWidget(widget)
+                self.scroll_area_layout_immersed.addItem(
+                    QtGui.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding))
+            else:
+                self.tdf_files = []
+        # Connect Buttons
+        self.connect_backend()
 
 
 class DialogSerialConnection(QtGui.QDialog):
@@ -704,19 +1082,45 @@ class DialogSerialConnection(QtGui.QDialog):
         self.button_box.button(QtGui.QDialogButtonBox.Cancel).clicked.connect(self.reject)
         # Update ports list
         self.ports = list_serial_comports()
-        # self.ports.append(type('obj', (object,), {'device': '/dev/ttys001', 'product': 'macOS Virtual Serial'}))  # Debug macOS serial
+        # self.ports.append(type('obj', (object,), {'device': '/dev/ttys001', 'product': 'macOS Virtual Serial', 'description': 'n/a'}))  # Debug macOS serial
+        ports_device = []
         for p in self.ports:
             # print(f'\n\n===\n{p.description}\n{p.device}\n{p.hwid}\n{p.interface}\n{p.location}\n{p.manufacturer}\n{p.name}\n{p.pid}\n{p.product}\n{p.serial_number}\n{p.vid}')
             p_name = str(p.device)
             if p.description is not None and p.description != 'n/a':
                 p_name += ' - ' + str(p.description)
             self.cb_port.addItem(p_name)
+            ports_device.append(p.device)
         # Set default values based on instrument
         baudrate, bytesize, parity, stopbits, timeout = '19200', '8 bits', 'none', '1', 2
         if hasattr(instrument, 'default_serial_baudrate'):
             baudrate = str(instrument.default_serial_baudrate)
+        if hasattr(instrument, 'default_serial_parity'):
+            parity = str(instrument.default_serial_parity)
         if hasattr(instrument, 'default_serial_timeout'):
             timeout = instrument.default_serial_timeout
+        if instrument.uuid in CFG.interfaces.keys():
+            if isinstance(CFG.interfaces[instrument.uuid], str):  # Support legacy format
+                CFG.interfaces[instrument.uuid]['port'] = CFG.interfaces[instrument.uuid]
+            if 'port' in CFG.interfaces[instrument.uuid].keys():
+                port = CFG.interfaces[instrument.uuid]['port']
+                if port in ports_device:
+                    self.cb_port.setCurrentIndex(ports_device.index(port))
+            if 'baudrate' in CFG.interfaces[instrument.uuid].keys():
+                baudrate = str(CFG.interfaces[instrument.uuid]['baudrate'])
+            if 'bytesize' in CFG.interfaces[instrument.uuid].keys():
+                bytesize = f"{CFG.interfaces[instrument.uuid]['bytesize']} bits"
+            if 'parity' in CFG.interfaces[instrument.uuid].keys():
+                try:
+                    parity = {serial.PARITY_EVEN: 'even', serial.PARITY_ODD: 'odd',
+                              serial.PARITY_MARK: 'mark', serial.PARITY_SPACE: 'space',
+                              serial.PARITY_NONE: 'none'}[CFG.interfaces[instrument.uuid]['parity']]
+                except KeyError:
+                    logger.warning('cfg parity invalid.')
+            if 'stopbits' in CFG.interfaces[instrument.uuid].keys():
+                stopbits = str(CFG.interfaces[instrument.uuid]['stopbits'])
+            if 'timeout' in CFG.interfaces[instrument.uuid].keys():
+                timeout = CFG.interfaces[instrument.uuid]['timeout']
         self.cb_baudrate.setCurrentIndex([self.cb_baudrate.itemText(i) for i in range(self.cb_baudrate.count())].index(baudrate))
         self.cb_bytesize.setCurrentIndex([self.cb_bytesize.itemText(i) for i in range(self.cb_bytesize.count())].index(bytesize))
         self.cb_parity.setCurrentIndex([self.cb_parity.itemText(i) for i in range(self.cb_parity.count())].index(parity))
@@ -750,7 +1154,7 @@ class DialogSerialConnection(QtGui.QDialog):
         elif self.cb_parity.currentText() == 'even':
             return serial.PARITY_EVEN
         elif self.cb_parity.currentText() == 'odd':
-            return serial.PARITY_EVEN
+            return serial.PARITY_ODD
         elif self.cb_parity.currentText() == 'mark':
             return serial.PARITY_MARK
         elif self.cb_parity.currentText() == 'space':
@@ -758,7 +1162,7 @@ class DialogSerialConnection(QtGui.QDialog):
         raise ValueError('serial parity not defined')
 
     @property
-    def stopbits(self) -> int:
+    def stopbits(self) -> (int, float):
         if self.cb_stopbits.currentText() == '1':
             return serial.STOPBITS_ONE
         elif self.cb_stopbits.currentText() == '1.5':
@@ -768,14 +1172,25 @@ class DialogSerialConnection(QtGui.QDialog):
         raise ValueError('serial stop bits not defined')
 
     @property
-    def timeout(self) -> int:
-        return int(self.sb_timeout.value())
+    def timeout(self) -> float:
+        return self.sb_timeout.value()
 
 
 class DialogSocketConnection(QtGui.QDialog):
     def __init__(self, parent):
         super().__init__(parent)
+        instrument = parent.instrument
         uic.loadUi(os.path.join(PATH_TO_RESOURCES, 'socket_connection.ui'), self)
+        # Set defaults
+        if instrument.uuid in CFG.interfaces.keys():
+            if isinstance(CFG.interfaces[instrument.uuid], str):  # Support legacy format
+                CFG.interfaces[instrument.uuid]['port'] = CFG.interfaces[instrument.uuid]
+            if 'socket_ip' in CFG.interfaces[instrument.uuid].keys():
+                ip = str(CFG.interfaces[instrument.uuid]['socket_ip'])
+                self.le_ip.setText(ip)
+            if 'socket_port' in CFG.interfaces[instrument.uuid].keys():
+                port = CFG.interfaces[instrument.uuid]['socket_port']
+                self.sb_port.setValue(port)
         # Connect buttons
         self.button_box.button(QtGui.QDialogButtonBox.Open).clicked.connect(self.accept)
         self.button_box.button(QtGui.QDialogButtonBox.Cancel).clicked.connect(self.reject)
@@ -800,7 +1215,7 @@ class DialogLoggerOptions(QtGui.QDialog):
         self.le_prefix_custom_connected = False
         self.instrument = parent.instrument
         # Logger Options
-        self.le_log_path.setText(self.instrument.log_get_path())
+        self.le_log_path.setText(self.instrument.log_path)
         self.button_browse_log_directory.clicked.connect(self.act_browse_log_directory)
         self.update_filename_template()
         # Connect Prefix Checkbox to update Filename Template
@@ -845,7 +1260,7 @@ class DialogLoggerOptions(QtGui.QDialog):
         self.show()
 
     def update_filename_template(self):
-        # self.le_filename_template.setText(instrument.log_get_filename())  # Not up to date
+        # self.le_filename_template.setText(instrument.log_filename)  # Not up to date
         self.le_filename_template.setText(self.cover_log_prefix + self.instrument.bare_log_prefix +
                                           '_YYYYMMDD_hhmmss.' + self.instrument.log_get_file_ext())
 
@@ -855,23 +1270,28 @@ class App(QtGui.QApplication):
         QtGui.QApplication.__init__(self, *args)
         self.splash_screen = QtGui.QSplashScreen(QtGui.QPixmap(os.path.join(PATH_TO_RESOURCES, 'inlinino.ico')))
         self.splash_screen.show()
+        self.setWindowIcon(QtGui.QIcon(os.path.join(PATH_TO_RESOURCES, 'inlinino.ico')))
         self.main_window = MainWindow()
         self.startup_dialog = DialogStartUp()
         self.splash_screen.close()
 
     def start(self, instrument_index=None):
-        if not isinstance(instrument_index, int) or instrument_index > len(CFG.instruments):
+        if isinstance(instrument_index, int) and instrument_index < len(CFG.instruments):
+            # Get instrument index
+            instrument_uuid = list(CFG.instruments.keys())[instrument_index]
+        elif isinstance(instrument_index, str) and instrument_index in CFG.instruments.keys():
+            instrument_uuid = instrument_index
+        else:
             logger.debug('Startup Dialog')
             self.startup_dialog.show()
             act = self.startup_dialog.exec_()
             if act == self.startup_dialog.LOAD_INSTRUMENT:
-                instrument_index = self.startup_dialog.selection_index
+                instrument_uuid = self.startup_dialog.selected_uuid
             elif act == self.startup_dialog.SETUP_INSTRUMENT:
-                setup_dialog = DialogInstrumentSetup(
-                    self.startup_dialog.instruments_to_setup[self.startup_dialog.selection_index])
+                setup_dialog = DialogInstrumentCreate(self.startup_dialog.selected_template)
                 setup_dialog.show()
                 if setup_dialog.exec_():
-                    instrument_index = setup_dialog.cfg_index
+                    instrument_uuid = setup_dialog.cfg_uuid
                 else:
                     logger.info('Setup closed')
                     self.start()  # Restart application to go back to startup screen
@@ -880,34 +1300,24 @@ class App(QtGui.QApplication):
                 sys.exit()
 
         # Load instrument
-        instrument_name = CFG.instruments[instrument_index]['model'] + ' ' \
-                          + CFG.instruments[instrument_index]['serial_number']
-        instrument_module_name = CFG.instruments[instrument_index]['module']
-        logger.debug('Loading instrument [' + str(instrument_index) + '] ' + instrument_name)
+        instrument_name = CFG.instruments[instrument_uuid]['model'] + ' ' \
+                          + CFG.instruments[instrument_uuid]['serial_number']
+        instrument_module_name = CFG.instruments[instrument_uuid]['module']
+        logger.debug('Loading instrument [' + str(instrument_uuid) + '] ' + instrument_name)
         instrument_loaded = False
         while not instrument_loaded:
             try:
-                if instrument_module_name == 'generic':
-                    self.main_window.init_instrument(Instrument(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'acs':
-                    self.main_window.init_instrument(ACS(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'dataq':
-                    self.main_window.init_instrument(DATAQ(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'hyperbb':
-                    self.main_window.init_instrument(HyperBB(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'lisst':
-                    self.main_window.init_instrument(LISST(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'nmea':
-                    self.main_window.init_instrument(NMEA(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'sunav2':
-                    self.main_window.init_instrument(SunaV2(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'sunav1':
-                    self.main_window.init_instrument(SunaV1(instrument_index, InstrumentSignals()))
-                elif instrument_module_name == 'taratsg':
-                    self.main_window.init_instrument(TaraTSG(instrument_index, InstrumentSignals()))
-                else:
+                instrument_class = {'generic': Instrument, 'acs': ACS, 'apogee': ApogeeQuantumSensor,
+                                    'dataq': DATAQ, 'hyperbb': HyperBB, 'hypernav': HyperNav,
+                                    'lisst': LISST, 'nmea': NMEA, 'ontrak': Ontrak, 'satlantic': Satlantic,
+                                    'sunav1': SunaV1, 'sunav2': SunaV2, 'taratsg': TaraTSG}
+                instrument_signal = HyperNavSignals if instrument_module_name == 'hypernav' else InstrumentSignals
+                if instrument_module_name not in instrument_class.keys():
                     logger.critical('Instrument module not supported')
                     sys.exit(-1)
+                self.main_window.init_instrument(instrument_class[instrument_module_name](
+                    instrument_uuid, CFG.instruments[instrument_uuid].copy(), instrument_signal()
+                ))
                 instrument_loaded = True
             except Exception as e:
                 raise e
@@ -915,7 +1325,7 @@ class App(QtGui.QApplication):
                 logger.warning(e)
                 self.closeAllWindows()  # ACS, HyperBB, LISST, and Suna are opening pyqtgraph windows
                 # Dialog Box
-                setup_dialog = DialogInstrumentSetup(instrument_index)
+                setup_dialog = DialogInstrumentUpdate(instrument_uuid)
                 setup_dialog.show()
                 setup_dialog.notification('Unable to load instrument. Please check configuration.', e)
                 if setup_dialog.exec_():

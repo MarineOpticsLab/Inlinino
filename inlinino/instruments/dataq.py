@@ -17,12 +17,12 @@ class DATAQ(Instrument):
                            'log_path', 'log_raw', 'log_products',
                            'variable_names', 'variable_units', 'variable_precision']
 
-    def __init__(self, cfg_id, signal, *args, **kwargs):
+    def __init__(self, uuid, cfg, signal, *args, **kwargs):
         # DATAQ Specific attributes
         self.channels_enabled = [0, 1, 2, 3, 4, 5, 6, 7]
         self.variable_equations = []
 
-        super().__init__(cfg_id, signal, *args, **kwargs)
+        super().__init__(uuid, cfg, signal, *args, **kwargs)
 
         # Default serial communication parameters
         self.default_serial_baudrate = 115200
@@ -33,6 +33,10 @@ class DATAQ(Instrument):
         if 'channels_enabled' not in cfg.keys():
             raise ValueError('Missing field channels enabled')
         self.channels_enabled = cfg['channels_enabled']
+        # Handle legacy configuration
+        for k in [k for k in cfg.keys() if k.startswith('variable_')]:
+            if len(cfg[k]) == 1 and cfg[k][0] == '':
+                del cfg[k]
         # Overload cfg with DATAQ specific parameters
         cfg['variable_names'] = ['C%d' % (c+1) for c in self.channels_enabled] + \
                                 (cfg['variable_names'] if 'variable_names' in cfg.keys() else [])

@@ -9,11 +9,11 @@ class NMEA(Instrument):
                            'log_path', 'log_raw', 'log_products',
                            'variable_names', 'variable_units', 'variable_types', 'variable_precision']
 
-    def __init__(self, cfg_id, signal, *args, **kwargs):
+    def __init__(self, uuid, cfg, signal, *args, **kwargs):
         self.active_timeseries_variables = []
-        self.plugin_active_timeseries_variables_selected = list()
+        self.widget_active_timeseries_variables_selected = list()
         self._unknown_nmea_sentence = []
-        super().__init__(cfg_id, signal, *args, **kwargs)
+        super().__init__(uuid, cfg, signal, *args, **kwargs)
 
         # Default serial communication parameters
         self.default_serial_baudrate = 4800
@@ -26,29 +26,25 @@ class NMEA(Instrument):
         super().setup(cfg)
         # Set active timeseries variables
         self.active_timeseries_variables = np.zeros(len(self.variable_types), dtype=bool)
-        self.plugin_active_timeseries_variables_selected = list()
+        self.widget_active_timeseries_variables_selected = list()
         for i, (k, t) in enumerate(zip(self.variable_names, self.variable_types)):
             if t in ['int', 'float']:
                 self.active_timeseries_variables[i] = True
-                self.plugin_active_timeseries_variables_selected.append(k)
+                self.widget_active_timeseries_variables_selected.append(k)
         # self._log_prod.variable_precision = []  # Disable precision when writing with log
 
     # def open(self, port=None, baudrate=4800, bytesize=8, parity='N', stopbits=1, timeout=10):
     #     super().open(port, baudrate, bytesize, parity, stopbits, timeout)
 
     def parse(self, packet):
-        msg = pynmea2.parse(packet.decode())
-        # except ValueError:
-        #     msg = packet.decode()
-        #     if msg[0] == '$':
-        #         header = msg.split(',', 1)[0]
-        #         if header not in self._unknown_nmea_sentence:
-        #             self._unknown_nmea_sentence.append(header)
-        #             self.signal.packet_corrupted.emit()
-        #             self.logger.warning(f'Unknown NMEA sentence: {header}')
+        data = [None] * len(self.variable_names)
+        try:  # Remove try statement to raise error
+            msg = pynmea2.parse(packet.decode())
+        except ValueError:  # Skip error for corrupted frames (probability to fill log is too high)
+            return data
+        # Commented line for dev purpose only
         # print(packet)
         # print(msg.fields)
-        data = [None] * len(self.variable_names)
         for i, (k, t) in enumerate(zip(self.variable_names, self.variable_types)):
             try:
                 if t == 'int':
@@ -66,7 +62,7 @@ class NMEA(Instrument):
 
     def handle_data(self, data, timestamp):
         if np.any(self.active_timeseries_variables):
-            self.signal.new_data.emit(np.array(data)[self.active_timeseries_variables], timestamp)
+            self.signal.new_ts_data.emit(np.array(data)[self.active_timeseries_variables], timestamp)
         if self.log_prod_enabled and self._log_active:
             self._log_prod.write(data, timestamp)
             if not self.log_raw_enabled:

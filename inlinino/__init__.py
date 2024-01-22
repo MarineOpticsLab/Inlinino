@@ -1,14 +1,14 @@
-import numpy as np
 import logging
 from logging.handlers import RotatingFileHandler
 from time import strftime, gmtime
-import json
 import sys
 import os
 import traceback
 
+import numpy as np
 
-__version__ = '2.7.5'
+
+__version__ = '2.9.8'
 
 # Setup Logger
 logging.basicConfig(level=logging.DEBUG)
@@ -34,7 +34,7 @@ else:
     root_logger.debug('Running from source')
     package_dir = os.path.dirname(__file__)
 PATH_TO_RESOURCES = os.path.join(package_dir, 'resources')
-PATH_TO_CFG_FILE = os.path.join(package_dir, 'inlinino_cfg.json')
+
 
 # Logging in file
 path_to_log = os.path.join(package_dir, 'logs')
@@ -46,43 +46,6 @@ ch_file = RotatingFileHandler(log_filename, maxBytes=1048576 * 5, backupCount=9)
 formater_file = logging.Formatter("%(asctime)s %(levelname)-8.8s [%(name)s]  %(message)s")
 ch_file.setFormatter(formater_file)
 root_logger.addHandler(ch_file)
-
-
-class BytesEncoder(json.JSONEncoder):
-    ENCODING = 'ascii'
-
-    def default(self, obj):
-        if isinstance(obj, bytes):
-            return {'__bytes__': self.ENCODING, 'content': obj.decode(self.ENCODING)}
-        # Let the base class default method raise the TypeError
-        return json.JSONEncoder.default(self, obj)
-
-
-def as_bytes(dct):
-    if '__bytes__' in dct:
-        return bytes(dct['content'], dct['__bytes__'])
-    return dct
-
-
-class Cfg:
-    def __init__(self):
-        self.__logger = logging.getLogger('CFG')
-        with open(PATH_TO_CFG_FILE) as file:
-            self.__logger.debug('Reading configuration.')
-            cfg = json.load(file, object_hook=as_bytes)
-        if 'instruments' not in cfg.keys():
-            self.__logger.critical('Unable to load instruments from configuration file.')
-            sys.exit(-1)
-        self.instruments = cfg['instruments']
-
-    def write(self):
-        self.__logger.info('Writing configuration.')
-        cfg = {'instruments': self.instruments}
-        with open(PATH_TO_CFG_FILE, 'w') as file:
-            json.dump(cfg, file, cls=BytesEncoder)
-
-
-CFG = Cfg()
 
 
 class RingBuffer:
@@ -116,3 +79,16 @@ class RingBuffer:
 
     def __str__(self):
         return str(self.data)
+
+
+# Set Constant(s)
+COLOR_SET = ['#1f77b4',  # muted blue
+             '#2ca02c',  # cooked asparagus green
+             '#ff7f0e',  # safety orange
+             '#d62728',  # brick red
+             '#9467bd',  # muted purple
+             '#8c564b',  # chestnut brown
+             '#e377c2',  # raspberry yogurt pink
+             '#7f7f7f',  # middle gray
+             '#bcbd22',  # curry yellow-green
+             '#17becf']  # blue-teal
